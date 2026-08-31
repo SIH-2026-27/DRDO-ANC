@@ -95,11 +95,8 @@ Both paths share the same upstream pipeline: manifest → mixture @ 16 kHz → r
 | `resampling.py` | Model-boundary resampling | DONE | `resample_mono` — uses `scipy.signal.resample_poly` |
 | `live/interfaces.py` | Hardware-independent live I/O ABCs | DONE | `AudioInput`, `AudioOutput` |
 | `live/fake.py` | In-memory I/O for tests | DONE | `FakeAudioInput`, `FakeAudioOutput` |
-| `live/sounddevice_backend.py` | Desktop mic/speaker backend | DONE | Duplex `sd.Stream` via `open_sounddevice_io()`; stereo downmix/upmix; `SoundDeviceStreamStats` |
-| `live/alignment.py` | Recording length lifecycle tracking | DONE | `RecordingLengthTracker` — stable leading-gap detection for post-flush alignment |
-| `live/recorder.py` | Live session recording | DONE | `LiveStreamRecorder`, `align_recorded_streams`, `LiveInstrumentation`, async WAV writer with bounded queue |
-| `live/session_analysis.py` | Offline live-session analysis | DONE | `analyze_live_session`, `find_energy_drop_windows` — delay-compensated energy-drop windows |
-| `live/pipeline.py` | Live streaming orchestration | DONE | `StreamingPipeline` — optional `recorder=`; flush tail via `note_flush_enhanced`; per-chunk instrumentation |
+| `live/sounddevice_backend.py` | Desktop mic/speaker backend | DONE | `SoundDeviceAudioInput`, `SoundDeviceAudioOutput`, `list_audio_devices` — via `sounddevice`/PortAudio |
+| `live/pipeline.py` | Live streaming orchestration | DONE | `StreamingPipeline` — arbitrary hardware chunks → `Enhancer.process_stream()` → output; single `flush()` on shutdown |
 | `live/__init__.py` | Public live-audio exports | DONE | |
 | `__init__.py` | Public audio exports | DONE | Re-exports io, mixing, resampling, live helpers |
 
@@ -162,11 +159,8 @@ Both paths share the same upstream pipeline: manifest → mixture @ 16 kHz → r
 | `test_evaluate_delay.py` | Delay compensation regression | DONE | Pins historical Freesound alignment metrics |
 | `test_streaming_backend.py` | Native backend smoke test | DONE | Frame processing, buffer, reset |
 | `test_enhancer_streaming.py` | Enhancer streaming smoke | DONE | Arbitrary chunk sizes |
-| `run_live_enhancement.py` | Live mic → enhancer → speaker CLI | DONE | `--model`, `--passthrough`, `--diagnose-audio`, `--record-dir`, duplex I/O |
+| `run_live_enhancement.py` | Live mic → enhancer → speaker CLI | DONE | `--model` (registry), `--passthrough`, `--list-devices`, `--chunk-size`, device selection |
 | `test_live_audio.py` | Live audio pipeline tests | DONE | Fake I/O only — no physical microphone required |
-| `test_live_recording.py` | Live recording tests | DONE | WAV/session/metadata validation; delayed-enhancer alignment; energy-drop analysis |
-| `analyze_live_session.py` | Offline live-session analysis CLI | DONE | Delay-compensated energy-drop window report for a session directory |
-| `test_live_passthrough.py` | Hardware passthrough diagnostics | DONE | Minimal duplex, pipeline, sine, capture-to-WAV modes |
 | `build_evaluation_fixtures.py` | Local manifest fixtures | DONE | Builds `tests/fixtures/evaluation_manifest/` at test time |
 | `evaluate.py` | Thin evaluation CLI | DONE | Wraps `drdo_anc.evaluation` |
 | `investigate_streaming_alignment.py` | Alignment investigation (read-only) | DONE | Offset sweep; not part of CI |
@@ -419,44 +413,14 @@ Evaluation:              same rate as model output / resampled reference
 Synchronous live-audio path for real-time enhancement (no dataset/manifest/evaluation layers involved).
 
 ```text
-open_sounddevice_io()  → shared SoundDeviceDuplexSession (one sd.Stream)
 SoundDeviceAudioInput.read(chunk_size)
-    ↓ mono float32 [T] in [-1, 1] (stereo downmixed)
+    ↓ arbitrary hardware chunk (float32 mono)
 StreamingPipeline
-    ↓ torch tensor (enhancement) or direct copy (pass-through)
+    ↓ torch tensor
 Enhancer.process_stream()          [or pass-through copy]
     ↓ inside enhancer: StreamingBuffer → model frames
 SoundDeviceAudioOutput.write()
-    ↓ mono duplicated to host output channels (typically stereo)
-PortAudio duplex playback
 ```
-
-### Audio representation at boundaries
-
-| Stage | dtype | shape | channels | sample rate | range |
-|-------|-------|-------|----------|-------------|-------|
-| PortAudio host capture | `float32` | `[T, C_in]` | native (often 2) | configured (e.g. 48 kHz) | `[-1, 1]` |
-| `AudioInput.read()` | `float32` | `[T]` | mono (downmixed) | same | `[-1, 1]` |
-| `StreamingPipeline` pass-through | `float32` | `[T]` | mono | same | unchanged |
-| `AudioOutput.write()` input | `float32` | `[T]` | mono | same | `[-1, 1]` |
-| PortAudio host playback | `float32` | `[T, C_out]` | native (often 2) | same | upmixed mono |
-
-Mono conversion: `downmix_to_mono()` averages stereo channels on capture. `upmix_mono_to_channels()` duplicates mono to both speakers on playback.
-
-### Duplex stream (passthrough fix)
-
-**Root cause of crackling (2026-08-29):** The original backend opened **separate** `InputStream` and `OutputStream`, called `start()` immediately in `__init__`, and used `channels=1` on stereo Realtek devices. The output stream underflowed before the first `write()`, and the two streams were not clock-locked.
-
-**Fix:** `open_sounddevice_io()` opens one **full-duplex** `sd.Stream` shared by input and output. The stream is started lazily on the first `read()`/`write()` so playback does not begin before audio is available. Host-native channel counts are used (stereo in/out on Realtek WASAPI); mono conversion happens at the API boundary.
-
-| API | Purpose |
-|-----|---------|
-| `SoundDeviceDuplexSession` | Shared duplex PortAudio stream + stats |
-| `open_sounddevice_io()` | Factory returning synchronized input/output pair |
-| `close_sounddevice_io()` | Clean shutdown |
-| `SoundDeviceStreamStats` | Overflow/timing diagnostics |
-
-Blocking mode: `stream.read()` / `stream.write()` on the same duplex stream (not separate callback streams).
 
 ### Interfaces
 
@@ -492,56 +456,6 @@ Hardware chunk sizes are unrelated to model frame sizes.
 - `scripts/run_live_enhancement.py --list-devices` prints PortAudio device indices.
 - `--input-device` / `--output-device` accept an integer index or host-specific name.
 - Omit both to use the host default input/output devices.
-- Prefer WASAPI devices at 48 kHz on Windows (e.g. Realtek indices on hostapi 2).
-
-### Recording
-
-Optional observability path — does not modify the real-time audio algorithm.
-
-```text
-AudioInput.read()
-    ↓
-LiveStreamRecorder.write_input()   → input.wav
-    ↓
-Enhancer.process_stream()
-    ↓
-LiveStreamRecorder.write_enhanced() → enhanced.wav
-    ↓
-AudioOutput.write()
-```
-
-| Item | Value |
-|------|-------|
-| Format | mono float32 WAV via `soundfile` |
-| Sample rate | same as live stream (e.g. 48 kHz) |
-| Delay compensation | **not applied** to WAVs — raw live signals; `streaming_delay_samples` stored in metadata for offline analysis |
-| Length guarantee | After `flush()`, `input_samples_recorded == enhanced_samples_recorded` when lifecycle proves a stable leading gap; otherwise `recording_alignment.status = mismatch` and finalize raises |
-| Session layout | `data/live_recordings/YYYY-MM-DD_HH-MM-SS/{input,enhanced}.wav + metadata.json` |
-| Disk I/O | background worker thread + bounded queue (drops counted, never blocks playback) |
-
-CLI: `--record-dir data\live_recordings`
-
-Shutdown: `enhancer.flush()` once → record enhanced tail → align lengths when proven → finalize WAVs + metadata.
-
-Offline analysis:
-
-```bash
-.venv\Scripts\python.exe scripts\analyze_live_session.py data\live_recordings\YYYY-MM-DD_HH-MM-SS
-```
-
-Uses `metadata.streaming_delay_samples` (or `--delay-samples`) with `apply_evaluation_delay` and reports windows where enhanced RMS energy drops unusually far below input.
-
-### Diagnostics
-
-| Script / flag | Purpose |
-|---------------|---------|
-| `scripts/test_live_passthrough.py --mode passthrough` | Minimal duplex read/write (no pipeline) |
-| `scripts/test_live_passthrough.py --mode pipeline` | `StreamingPipeline` pass-through with stats |
-| `scripts/test_live_passthrough.py --mode sine` | 440 Hz tone → output (isolates playback) |
-| `scripts/test_live_passthrough.py --mode capture` | Mic → WAV (isolates capture) |
-| `run_live_enhancement.py --diagnose-audio` | JSON stats every second during live run |
-
-Stats include `input_overflows`, `samples_read`/`samples_written`, `realtime_ratio`, and peak levels.
 
 ### Shutdown semantics
 
@@ -1037,8 +951,6 @@ These components are working infrastructure. **Extend only for concrete requirem
     - `scripts/test_streaming_backend.py`
     - `scripts/test_enhancer_streaming.py`
     - `scripts/test_live_audio.py`
-    - `scripts/test_live_recording.py`
-    - `scripts/test_live_passthrough.py` (hardware diagnostics)
 14. Prefer small, targeted changes over broad rewrites.
 
 **Environment:** Use project virtualenv `.venv\Scripts\python.exe` on Windows — system Python may lack `libdf` / DeepFilterNet dependencies.
@@ -1152,39 +1064,11 @@ These investigations explain **why** the architecture exists:
 | **Status** | DONE |
 | **Validation** | `test_live_audio.py` (6 tests, fake I/O only); full regression suite pass (2026-08-29) |
 
-### Step 4B — Live passthrough crackling fix
-
-| | |
-|-|-|
-| **Objective** | Fix unintelligible crackling on Windows Realtek passthrough |
-| **Root cause** | Separate unsynchronized Input/Output streams started before first audio; mono-on-stereo device mismatch |
-| **Key implementation** | `SoundDeviceDuplexSession`, `open_sounddevice_io()`, stereo downmix/upmix, deferred stream start, `test_live_passthrough.py` |
-| **Status** | DONE |
-| **Validation** | `test_live_audio.py` pass; hardware duplex test 0 overflows on Realtek 15→12 @ 48 kHz |
-
-### Step 4C — Live session recording
-
-| | |
-|-|-|
-| **Objective** | Record raw live input and enhanced output for offline diagnosis |
-| **Key implementation** | `audio/live/recorder.py`; `StreamingPipeline(recorder=...)`; `--record-dir` on `run_live_enhancement.py` |
-| **Status** | DONE |
-| **Validation** | `test_live_recording.py`; hardware smoke recording on Realtek 15→12 |
-
-### Step 4D — Recording length alignment + offline session analysis
-
-| | |
-|-|-|
-| **Objective** | Guarantee equal input/enhanced recording lengths after `flush()` when lifecycle proves padding; analyze sessions offline with model delay compensation |
-| **Key implementation** | `audio/live/alignment.py`, `align_recorded_streams()` in `recorder.py`, `session_analysis.py`, `scripts/analyze_live_session.py`; `streaming_delay_samples` in recording metadata |
-| **Status** | DONE |
-| **Validation** | `test_live_recording.py` (10 tests); `analyze_live_session.py` on hardware session |
-
 ---
 
 ## LAST VERIFIED
 
-**2026-08-30**
+**2026-08-29**
 
 ## CURRENT PROJECT STATE
 
