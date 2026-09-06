@@ -1,4 +1,7 @@
 .venv/
+venv/
+venv312/
+.venv-dfn3-cuda/
 __pycache__/
 *.pyc
 
@@ -11,6 +14,11 @@ models/*.onnx
 *.wav
 *.mp3
 *.flac
+*.hdf5
+*.ckpt
+*.pth
+*.pt
+*.onnx
 
 .ipynb_checkpoints/
 .vscode/
@@ -22,6 +30,7 @@ external/
 csv/
 *.csv
 *.txt
+!src/drdo_anc/fine_tune/requirements-wsl-cuda.txt
 *.log
 *.log.*
 *.log.*.*
@@ -44,5 +53,8 @@ zip/
 *.tar.lzo
 
 data/benchmark_results/
+data/mvp/dfn3/
+data/mvp/finetune/
+dataset/
 data/
 data/live_recordings/

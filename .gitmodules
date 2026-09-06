@@ -1,0 +1,3 @@
+[submodule "dfn3-model-files/deepfilternet"]
+	path = dfn3-model-files/deepfilternet
+	url = https://github.com/Rikorose/DeepFilterNet.git
